@@ -176,18 +176,22 @@
         # Helper Functions #
         ####################
             
+            # The global list of containers defined in the compose stack
+            #
+            # TODO: Parse container-compose.yml and read in valid service
+            #       containers from there instead of hardcoding them here
+            #
+            containers=('api' 'app' 'database')
+            
             function validateContainer {
                 local args=("$@")
                 
-                local containers=('app' 'database')
                 local targetContainer="${args[0]}"
                 
                 # Validate the targetContainer name
                 if [[ " ${containers[*]} " =~ [[:space:]]${targetContainer}[[:space:]] ]]; then
                     return 0
                 else
-                    error "Error! Invalid container: $targetContainer"
-                    error "Valid containers: ${containers[*]}"
                     return 1
                 fi
             }
@@ -264,7 +268,7 @@
         
         function build {
             local args=("$@")
-            local targetContainer="${args[0]}"
+            local targetContainer="${args[0]}" # TODO: Support multiple containers
             
             # Check if a targetContainer is supplied;
             # otherwise, all containers will be built
@@ -273,6 +277,9 @@
                 validateContainer "$targetContainer"
                 # Check if a validation error occurred
                 if [[ "$?" -ne 0 ]]; then
+                    error "Error! Invalid container: $targetContainer"
+                    error "Valid containers: ${containers[*]}"
+                    
                     return "$?"
                 fi
                 # "Shift out" the targetContainer arg from the list of args
@@ -294,11 +301,89 @@
     #########
     # start #
     #########
-    
+        
+        # Either `compose start`s a set of existing containers given their stack service names as args,
+        # or `compose up`s the entire stack. Use -- to seperate between list of containers and command args.
+        #
+        # Note: If `compose up` is determined for use, all args will be passed to that command instaed
+        #
+        # Note: `compose start` only starts existing stopped containers,
+        #       while `compose up` creates them from the stack
+        #
         function start {
-            podman-compose up
-            return "$?"
+            local args=("$@")
+            
+            # Short circut no args to compose-up
+            if [[ -z "${args[@]}" ]]; then
+                podman-compose up "${args[@]}"
+                return "$?"
+            fi
+            
+            # Seperate passed container args from passed command args, whether applicable or not.
+            #
+            # For this function, only the compose-start command requires such a distinction,
+            # but the function determines whether to compose-start or compose-up depending on
+            # the targetContainers supplied anyways.
+            #
+            # While doing all the work upfront maybe wasteful, it's more readable at the moment
+            
+            local separatorHasBeenFound=false
+            
+            local argsList1=() # targetContainer args
+            local argsList2=() # args for the command
+            
+            for currentArg in "${args[@]}"; do
+                [[ "$currentArg" == '--' ]]
+                local argIsSeperator="$?"
+                
+                if [[ "$separatorHasBeenFound" = false && "$argIsSeperator" -eq 0 ]]; then
+                    separatorHasBeenFound=true
+                elif [[ "$separatorHasBeenFound" = false ]]; then
+                    # No seperator yet; arg belongs in the first bucket
+                    argsList1+=("$currentArg")
+                else
+                    # Seperator found; arg belongs in the second bucket
+                    argsList2+=("$currentArg")
+                fi
+            done
+            
+            # In an attempt to compose-start, look for at least one valid container from the targetContainers
+            # otherwise, the container stack will be upped, and both argsLists will be passed to that command
+            
+            # Assume the first set of args are targetContainers
+            local targetContainers=("${argsList1[@]}")
+            local validTargetContainers=()
+            
+            for targetContainer in "${targetContainers[@]}"; do
+                
+                validateContainer "$targetContainer"
+                # If validation was successful, add the container to the set of validTargetContainers for processing;
+                if [[ "$?" -eq 0 ]]; then
+                    validTargetContainers+=("$targetContainer")
+                else # otherwise, indicate its invalidity and omit it from the list of validTargetContainers
+                    error "Invalid container: $targetContainer"
+                fi
+            done
+            
+            if (( ${#validTargetContainers[@]} != 0 )); then
+                
+                # Valid targetContainers found;
+                # gather args and compose-start
+                local commandArgs="${argsList2[@]}"
+                podman-compose start "${validTargetContainers[@]}" "${commandArgs[@]}"
+                return "$?"
+                
+            else
+                
+                # No valid targetContainers to start supplied;
+                # compose-up instead, using all supplied args
+                argsList1+=("${argsList2[@]}")
+                podman-compose up "${argsList1[@]}"
+                return "$?"
+                
+            fi
         }
+        alias up='start'
         alias default='start'
         alias run='default' # TODO: Make a TASKFILE_RUN_RUNS_DEFAULT=1 flag that automatically runs the
                             #       "default" task if no args are supplied to run. That way, we optionally
@@ -325,19 +410,112 @@
     ########
         
         function stop {
-            podman-compose stop
-            return "$?"
+            local args=("$@")
+            local targetContainer="${args[0]}" # TODO: Support multiple containers
+            
+            # Check if a targetContainer is supplied;
+            # otherwise, all containers will be downed
+            if [[ -n "$targetContainer" ]] then
+                
+                validateContainer "$targetContainer"
+                # Check if a validation error occurred
+                if [[ "$?" -ne 0 ]]; then
+                    error "Error! Invalid container: $targetContainer"
+                    error "Valid containers: ${containers[*]}"
+                    
+                    return "$?"
+                fi
+                # "Shift out" the targetContainer arg from the list of args
+                args=("${args[@]:1}")
+                
+                podman-compose stop "$targetContainer" "${args[@]}"
+                return "$?"
+                
+            else
+                
+                # Stop the stack
+                podman-compose stop "${args[@]}"
+                return "$?"
+                
+            fi
         }
     
     ########
     # down #
     ########
+    #
+    # Note: The -t option in the compose-down command can
+    #       be used to forcibly SIGKILL the containers in
+    #       specified number of seconds after the initial
+    #       SIGTERM command is issued
+    #
         
         function down {
-            podman-compose down
-            return "$?"
+            local args=("$@")
+            
+            # Short circut no args to compose-down
+            if [[ -z "${args[@]}" ]]; then
+                podman-compose down "${args[@]}"
+                return "$?"
+            fi
+            
+            local separatorHasBeenFound=false
+            
+            local argsList1=() # targetContainer args
+            local argsList2=() # args for the command
+            
+            for currentArg in "${args[@]}"; do
+                [[ "$currentArg" == '--' ]]
+                local argIsSeperator="$?"
+                
+                if [[ "$separatorHasBeenFound" = false && "$argIsSeperator" -eq 0 ]]; then
+                    separatorHasBeenFound=true
+                elif [[ "$separatorHasBeenFound" = false ]]; then
+                    # No seperator yet; arg belongs in the first bucket
+                    argsList1+=("$currentArg")
+                else
+                    # Seperator found; arg belongs in the second bucket
+                    argsList2+=("$currentArg")
+                fi
+            done
+            
+            # Assume the first set of args are targetContainers
+            local targetContainers=("${argsList1[@]}")
+            local validTargetContainers=()
+            
+            for targetContainer in "${targetContainers[@]}"; do
+                
+                validateContainer "$targetContainer"
+                # If validation was successful, add the container to the set of validTargetContainers for processing;
+                if [[ "$?" -eq 0 ]]; then
+                    validTargetContainers+=("$targetContainer")
+                else # otherwise, indicate its invalidity and omit it from the list of validTargetContainers
+                    error "Invalid container: $targetContainer"
+                fi
+            done
+            
+            if (( ${#validTargetContainers[@]} != 0 )); then
+                local commandArgs="${argsList2[@]}"
+                podman-compose down "${validTargetContainers[@]}" "${commandArgs[@]}"
+                return "$?"
+                
+            else
+                
+                argsList1+=("${argsList2[@]}")
+                podman-compose down "${argsList1[@]}"
+                return "$?"
+                
+            fi
         }
         alias clean='down'
+    
+    ############
+    # down pod #
+    ############
+        
+        function down-pod {
+            podman pod rm --force --ignore --time 0 "pod_${COMPOSE_PROJECT_NAME:-'moviemanager'}"
+        }
     
     ##########
     # attach #
@@ -350,6 +528,9 @@
             validateContainer "$targetContainer"
             # Check if a validation error occurred
             if [[ "$?" -ne 0 ]]; then
+                error "Error! Invalid container: $targetContainer"
+                error "Valid containers: ${containers[*]}"
+                
                 return "$?"
             fi
             # "Shift out" the targetContainer arg from the list of args
@@ -365,8 +546,14 @@
     ###########
         
         function restart {
+            # TODO: Use alias 'up' for start task when aliases are working
+            #
+            # Note: We're using the pod rm command instead of downing the
+            #       stack with compose-down for the time being due to a bug:
+            #       https://github.com/containers/podman-compose/issues/921
+            #
             stop
-            down
+            down -- -t 1 && down-pod
             start
             return "$?"
         }
@@ -387,13 +574,103 @@
         }
     
     ########
+    # lock #
+    ########
+    #
+    # Locks service-level app dependencies
+    #
+    # TODO: This task should exist seperately in Taskfiles
+    #       that live in each of the service-level directories.
+    #       This parent Taskfile would then proxy tasks issued
+    #       here to the service being targeted, if applicable.
+    #       The same could be done for the container management tasks
+    #       
+    #       Locking could also occur within the container
+    #       instead of the host like this, if the host
+    #       src/ code volume is active, so that the user
+    #       doesn't necessarily need to install PipEnv
+    #       on their host
+    #
+    # TODO: Two sets of args, first set specifying the target services,
+    #       else all services if none specified, and the second set being
+    #       the set of args to pass to the pipenv lock command. Seperate
+    #       sets of args with --. See the other container tasks doing this
+    #
+        
+        function lock {
+            local args=("$@")
+            
+            local services=('app' 'api')
+            
+            for service in "${services[@]}"; do
+                pushd . >> /dev/null
+                    trap 'popd > /dev/null' SIGINT SIGABRT
+                    cd "./$service/src/"
+                    command pipenv lock "${args[@]}"
+                popd >> /dev/null
+            done
+        }
+    
+    ####################
+    # database-connect #
+    ####################
+        
+        function database-connect {
+            local image='mariadb'
+            
+            command podman run -it --rm "$image" mariadb --host host.containers.internal -P3306 --user movie_manager_user -ppass1234 --database MovieManager
+        }
+    
+    ###################
+    # fix-permissions #
+    ###################
+        
+        function fix-permissions {
+            local args=("$@")
+            
+            local services=('app' 'api')
+            
+            for service in "${services[@]}"; do
+                pushd . >> /dev/null
+                    trap 'popd > /dev/null' SIGINT SIGABRT
+                    cd "./$service/"
+                    sudo chown -R $(whoami):$(whoami) src
+                    sudo chmod -R 755 src
+                    sudo chcon -Rt svirt_sandbox_file_t src
+                popd >> /dev/null
+            done
+        }
+    
+    ########
+    # tofu #
+    ########
+    #
+    # TODO: Wrap commands for `plan`ning and `deploy`ing
+    #       infrustructure with a valid environment arg
+    #       instead of wrapping the whole binary like this
+    #
+        
+        function tofu {
+            local args=("$@")
+            
+            local tofu; tofu=$(which tofu); [[ "$?" -eq 0 ]] || return 1
+            
+            pushd . >> /dev/null
+                trap 'popd > /dev/null' SIGINT SIGABRT
+                cd ./iac/src/
+                command "$tofu" "${args[@]}"
+            popd >> /dev/null
+        }
+        alias opentofu='tofu'
+    
+    ########
     # edit #
     ########
         
         function edit {
             local args=("$@")
             
-            if [[ "${args[0]}" = 'taskfile' ]]; then
+            if [[ "${args[0]}" = 'Taskfile' ]]; then
                 editor .
             else
                 editor "${args[0]}"
